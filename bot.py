@@ -1,7 +1,9 @@
 import os
+import io
 import random
 import time
 import re
+import json
 import threading
 import requests
 import phonenumbers
@@ -31,9 +33,8 @@ TELEGRAM_OTP_CHAT_ID = "-1004346608192"
 
 RECORDS_TO_FETCH = 50
 POLL_INTERVAL = 10
-
-# Auto-expiry time for generated numbers (seconds)
-NUMBER_EXPIRY_SECONDS = 25 * 60   # 25 minutes
+NUMBER_EXPIRY_SECONDS = 25 * 60
+DATA_FILE = "/data/bot_data.json"
 
 # ================== BOT INIT ==================
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -41,6 +42,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # ================== IN-MEMORY DATA ==================
 user_data = {}
 pending_withdrawals = []
+withdrawal_history = []
 services = []
 countries = []
 admin_states = {}
@@ -49,13 +51,75 @@ number_owners = {}
 number_meta = {}
 otp_rates = {}
 user_otp_stats = {}
-
-# Each entry: phone -> {"expires_at": timestamp}
 active_numbers = {}
+used_numbers_permanent = set()
 
 processed_messages = set()
 data_lock = threading.Lock()
 first_sync_done = False
+
+# ================== PERSISTENT STORAGE ==================
+def save_data():
+    try:
+        with data_lock:
+            data = {
+                "backup_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "user_data": {str(k): v for k, v in user_data.items()},
+                "user_otp_stats": {str(k): v for k, v in user_otp_stats.items()},
+                "services": services,
+                "countries": countries,
+                "imported_numbers": imported_numbers,
+                "otp_rates": otp_rates,
+                "pending_withdrawals": pending_withdrawals,
+                "withdrawal_history": withdrawal_history[-500:],
+                "number_owners": number_owners,
+                "number_meta": number_meta,
+                "used_numbers_permanent": list(used_numbers_permanent),
+            }
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"❌ SAVE ERROR: {e}")
+        return False
+
+
+def load_data():
+    global user_data, user_otp_stats, services, countries, imported_numbers, otp_rates
+    global pending_withdrawals, withdrawal_history, number_owners, number_meta, used_numbers_permanent
+    try:
+        if not os.path.exists(DATA_FILE):
+            print("📂 No saved data found.")
+            return False
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        user_data = {int(k): v for k, v in data.get("user_data", {}).items()}
+        user_otp_stats = {int(k): v for k, v in data.get("user_otp_stats", {}).items()}
+        services = data.get("services", [])
+        countries = data.get("countries", [])
+        imported_numbers = data.get("imported_numbers", {})
+        otp_rates = data.get("otp_rates", {})
+        pending_withdrawals = data.get("pending_withdrawals", [])
+        withdrawal_history = data.get("withdrawal_history", [])
+        number_owners = data.get("number_owners", {})
+        number_meta = data.get("number_meta", {})
+        used_numbers_permanent = set(data.get("used_numbers_permanent", []))
+
+        print(f"✅ Loaded: {len(user_data)} users, {len(services)} services, "
+              f"{len(countries)} countries, {len(imported_numbers)} groups.")
+        return True
+    except Exception as e:
+        print(f"❌ LOAD ERROR: {e}")
+        return False
+
+
+def auto_save_loop():
+    print("💾 Auto-save thread started (every 30s).")
+    while True:
+        time.sleep(30)
+        save_data()
 
 # ================== KEYBOARDS ==================
 def get_main_keyboard(user_id):
@@ -69,6 +133,7 @@ def get_main_keyboard(user_id):
     if is_admin(user_id):
         markup.add(KeyboardButton("🛠 Admin Panel", style="success"))
     return markup
+
 
 def get_admin_keyboard():
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -89,9 +154,12 @@ def get_admin_keyboard():
         KeyboardButton("📋 View Services", style="success"),
         KeyboardButton("🌐 View Countries", style="success"),
         KeyboardButton("📁 View Imported Numbers", style="success"),
+        KeyboardButton("📤 Backup Data", style="success"),
+        KeyboardButton("📥 Import Backup", style="success"),
         KeyboardButton("⬅️ User Menu", style="success"),
     )
     return markup
+
 
 def get_service_keyboard():
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -102,6 +170,7 @@ def get_service_keyboard():
             markup.add(KeyboardButton(service, style="success"))
     markup.add(KeyboardButton("⬅️ Back", style="success"))
     return markup
+
 
 def get_country_keyboard():
     markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -117,6 +186,7 @@ def get_country_keyboard():
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+
 def send_admin_panel(message):
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "❌ You are not authorized!")
@@ -129,8 +199,10 @@ def send_admin_panel(message):
         parse_mode='Markdown'
     )
 
+
 def finish_admin_action(user_id):
     admin_states.pop(user_id, None)
+
 
 def ensure_user(user_id):
     if user_id not in user_data:
@@ -144,6 +216,7 @@ def ensure_user(user_id):
     today = time.strftime("%Y-%m-%d")
     if user_id not in user_otp_stats:
         user_otp_stats[user_id] = {"total": 0, "today": 0, "last_date": today}
+
 
 def parse_numbers_from_bytes(raw_bytes):
     try:
@@ -171,6 +244,7 @@ def parse_numbers_from_bytes(raw_bytes):
         print(f"PARSE ERROR: {e}")
         return None
 
+
 def mask_number(num):
     if not num:
         return "XXXX"
@@ -181,8 +255,8 @@ def mask_number(num):
         return clean[:2] + "XXXX" + clean[-2:]
     return clean[:4] + "XXXX" + clean[-4:]
 
+
 def number_with_plus(num):
-    """Ensure the number is shown with a leading + sign."""
     if not num:
         return ""
     clean = str(num).strip()
@@ -190,19 +264,9 @@ def number_with_plus(num):
         clean = '+' + clean
     return clean
 
-def has_owner_otp(phone_number):
-    """Check whether the owner already received an OTP for this number."""
-    with data_lock:
-        owner = number_owners.get(str(phone_number).strip())
-        if not owner:
-            return False
-        stats = user_otp_stats.get(owner, {})
-        # A number is 'used' if the owner exists and the number is not in active_numbers
-        return str(phone_number).strip() not in active_numbers
 
 def expire_loop():
-    """Background thread: remove expired numbers from active_numbers."""
-    print("⏱️ Expiry thread started (25 min).")
+    print("⏱️ Expiry thread started.")
     while True:
         try:
             now = time.time()
@@ -210,22 +274,22 @@ def expire_loop():
                 expired = [n for n, d in active_numbers.items() if d["expires_at"] <= now]
                 for n in expired:
                     active_numbers.pop(n, None)
-                    # Also remove ownership so an expired number is freed up
                     if n in number_owners:
                         number_owners.pop(n, None)
                     if n in number_meta:
                         number_meta.pop(n, None)
                 if expired:
-                    print(f"⏰ Expired {len(expired)} number(s): {expired}")
+                    print(f"⏰ Expired {len(expired)} numbers.")
         except Exception as e:
             print(f"EXPIRY ERROR: {e}")
         time.sleep(60)
 
-# ================== TELEGRAM COMMANDS ==================
+# ================== COMMANDS ==================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
     ensure_user(user_id)
+    save_data()
     bot.reply_to(
         message,
         "👋 **Welcome to Number Bot!**\n\n"
@@ -237,9 +301,20 @@ def send_welcome(message):
         parse_mode='Markdown'
     )
 
+
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
     send_admin_panel(message)
+
+
+@bot.message_handler(commands=['cancel'])
+def cancel_command(message):
+    user_id = message.from_user.id
+    if admin_states.get(user_id):
+        admin_states.pop(user_id, None)
+        bot.reply_to(message, "❌ Cancelled.", reply_markup=get_main_keyboard(user_id))
+    else:
+        bot.reply_to(message, "❌ Nothing to cancel.", reply_markup=get_main_keyboard(user_id))
 
 # ================== MAIN HANDLER ==================
 @bot.message_handler(func=lambda message: True)
@@ -249,83 +324,114 @@ def handle_buttons(message):
         text = message.text
         ensure_user(user_id)
 
-        # ===== SUPPORT =====
+        # ==========================================================
+        # STEP 1: Reply Keyboard Menu Buttons (HIGHEST PRIORITY)
+        # ==========================================================
+        MAIN_BUTTONS = {"☎️GET NUMBERS", "💰BALANCE", "💸WITHDRAW", "🆘 Support", "🛠 Admin Panel"}
+        ADMIN_BUTTONS = {
+            "📥 Import Numbers", "📊 Bot Stats", "💳 Add Balance", "💵 Add Rate",
+            "📋 View Rates", "🗑️ Delete Rate", "📢 Broadcast", "⏳ Pending Withdrawals",
+            "📝 Add Service", "🌍 Add Country", "🗑️ Delete Service", "🗑️ Delete Country",
+            "🗑️ Delete Numbers", "📋 View Services", "🌐 View Countries",
+            "📁 View Imported Numbers", "📤 Backup Data", "📥 Import Backup",
+            "⬅️ User Menu"
+        }
+        ALL_MENU_BUTTONS = MAIN_BUTTONS | ADMIN_BUTTONS
+
+        # If a menu button is pressed while a state is active, cancel the state
+        if text in ALL_MENU_BUTTONS:
+            if admin_states.get(user_id):
+                if not admin_states.get(user_id, "").startswith("wd_"):
+                    admin_states.pop(user_id, None)
+
+        # ==========================================================
+        # STEP 2: Support
+        # ==========================================================
         if text == "🆘 Support":
+            admin_states.pop(user_id, None)
             markup = InlineKeyboardMarkup(row_width=1)
-            markup.add(InlineKeyboardButton(
-                text="💬 Contact Support",
-                url=SUPPORT_URL,
-                style="success"
-            ))
-            markup.add(InlineKeyboardButton(
-                text="❌ Close",
-                callback_data=f"support_close|{user_id}",
-                style="success"
-            ))
-            bot.reply_to(
-                message,
-                "💬 **Contact us for any help:**",
-                reply_markup=markup,
-                parse_mode='Markdown'
-            )
+            markup.add(InlineKeyboardButton(text="💬 Contact Support", url=SUPPORT_URL, style="success"))
+            markup.add(InlineKeyboardButton(text="❌ Close", callback_data=f"support_close|{user_id}", style="success"))
+            bot.reply_to(message, "💬 **Contact us for any help:**", reply_markup=markup, parse_mode='Markdown')
             return
 
-        # ===== USER WITHDRAW FLOW =====
+        # ==========================================================
+        # STEP 3: Withdraw Flow (state-based)
+        # ==========================================================
         wd_state = admin_states.get(user_id)
 
         if wd_state and wd_state.startswith("wd_number|||"):
-            method = wd_state.split("|||", 1)[1]
-            bkash_number = text.strip()
-            if not re.match(r'^01[3-9]\d{8}$', bkash_number):
-                bot.reply_to(message, f"❌ **Invalid {method} number!**\n\nPlease enter a valid 11-digit number.", parse_mode='Markdown')
-                return
-            balance = user_data.get(user_id, {}).get("balance", 0)
-            if balance <= 0:
+            if text in ALL_MENU_BUTTONS:
                 admin_states.pop(user_id, None)
-                bot.reply_to(message, "❌ No balance!", reply_markup=get_main_keyboard(user_id))
+                # fall through to menu handling
+            else:
+                method = wd_state.split("|||", 1)[1]
+                bkash_number = text.strip()
+                if not re.match(r'^01[3-9]\d{8}$', bkash_number):
+                    bot.reply_to(message, f"❌ **Invalid {method} number!**\n\nPlease enter a valid 11-digit number.\n\n_/cancel to abort._", parse_mode='Markdown')
+                    return
+                balance = user_data.get(user_id, {}).get("balance", 0)
+                if balance <= 0:
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ No balance!", reply_markup=get_main_keyboard(user_id))
+                    return
+                admin_states[user_id] = f"wd_amount|||{method}|||{bkash_number}"
+                bot.reply_to(message, f"✅ {method} Number: `{bkash_number}`\n\n💰 **Enter withdraw amount** (in BDT):\n\nAvailable: {balance:.2f} BDT\n\n_Example: 50_", parse_mode='Markdown')
                 return
-            admin_states[user_id] = f"wd_amount|||{method}|||{bkash_number}"
-            bot.reply_to(message, f"✅ {method} Number: `{bkash_number}`\n\n💰 **Enter withdraw amount** (in BDT):\n\nAvailable: {balance:.2f} BDT\n\n_Example: 50_", parse_mode='Markdown')
-            return
 
         if wd_state and wd_state.startswith("wd_amount|||"):
-            parts = wd_state.split("|||")
-            method = parts[1]
-            bkash_number = parts[2]
-            try:
-                amount = float(text.strip())
-                if amount <= 0:
-                    raise ValueError
-            except:
-                bot.reply_to(message, "❌ Invalid amount! Enter a number (e.g. 50).")
-                return
-            balance = user_data.get(user_id, {}).get("balance", 0)
-            if amount > balance:
-                bot.reply_to(message, f"❌ **Insufficient balance!**\n\nAvailable: {balance:.2f} BDT\nRequested: {amount:.2f} BDT", parse_mode='Markdown')
-                return
-            pending_withdrawals.append({
-                "user_id": user_id, "amount": amount, "method": method, "number": bkash_number,
-                "service": user_data[user_id].get("service", "Unknown"),
-                "country": user_data[user_id].get("country", "Unknown")
-            })
-            user_data[user_id]["balance"] -= amount
-            admin_states.pop(user_id, None)
-            for admin_id in ADMIN_IDS:
+            if text in ALL_MENU_BUTTONS:
+                admin_states.pop(user_id, None)
+            else:
+                parts = wd_state.split("|||")
+                method = parts[1]
+                bkash_number = parts[2]
                 try:
-                    bot.send_message(admin_id, f"🔔 **New Withdrawal Request!**\n\n👤 User: `{user_id}`\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n📞 Number: `{bkash_number}`", parse_mode='Markdown')
+                    amount = float(text.strip())
+                    if amount <= 0:
+                        raise ValueError
                 except:
-                    pass
-            bot.reply_to(message, f"✅ **Withdrawal Request Submitted!**\n\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n📞 Number: `{bkash_number}`\n\n⏳ Status: Pending admin approval", reply_markup=get_main_keyboard(user_id), parse_mode='Markdown')
+                    bot.reply_to(message, "❌ Invalid amount! Enter a number (e.g. 50).\n\n_/cancel to abort._", parse_mode='Markdown')
+                    return
+                balance = user_data.get(user_id, {}).get("balance", 0)
+                if amount > balance:
+                    bot.reply_to(message, f"❌ **Insufficient balance!**\n\nAvailable: {balance:.2f} BDT\nRequested: {amount:.2f} BDT", parse_mode='Markdown')
+                    return
+                pending_withdrawals.append({
+                    "user_id": user_id, "amount": amount, "method": method, "number": bkash_number,
+                    "service": user_data[user_id].get("service", "Unknown"),
+                    "country": user_data[user_id].get("country", "Unknown"),
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                user_data[user_id]["balance"] -= amount
+                admin_states.pop(user_id, None)
+                save_data()
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"🔔 **New Withdrawal!**\n\n👤 User: `{user_id}`\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n📞 Number: `{bkash_number}`", parse_mode='Markdown')
+                    except:
+                        pass
+                bot.reply_to(message, f"✅ **Withdrawal Request Submitted!**\n\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n📞 Number: `{bkash_number}`\n\n⏳ Pending admin approval", reply_markup=get_main_keyboard(user_id), parse_mode='Markdown')
+                return
+
+        # Backup import cancel
+        if wd_state == "waiting_for_backup_file" and text.strip().upper() == "CANCEL":
+            admin_states.pop(user_id, None)
+            bot.reply_to(message, "❌ Backup import cancelled.", reply_markup=get_admin_keyboard())
             return
 
-        # ===== ADMIN PANEL =====
+        # ==========================================================
+        # STEP 4: Admin Panel
+        # ==========================================================
         if text == "🛠 Admin Panel":
+            admin_states.pop(user_id, None)
             send_admin_panel(message)
             return
 
         if is_admin(user_id):
             # IMPORT NUMBERS
             if text == "📥 Import Numbers":
+                admin_states.pop(user_id, None)
                 if not services:
                     bot.reply_to(message, "❌ No services! Add a service first.", reply_markup=get_admin_keyboard())
                     return
@@ -333,11 +439,12 @@ def handle_buttons(message):
                     bot.reply_to(message, "❌ No countries! Add a country first.", reply_markup=get_admin_keyboard())
                     return
                 admin_states[user_id] = "import_select_service"
-                bot.reply_to(message, "📥 **Step 1/3: Select Service**", reply_markup=get_service_keyboard(), parse_mode='Markdown')
+                bot.reply_to(message, "📥 **Step 1/3: Select Service**\n\n_/cancel to abort._", reply_markup=get_service_keyboard(), parse_mode='Markdown')
                 return
 
             # ADD RATE
             if text == "💵 Add Rate":
+                admin_states.pop(user_id, None)
                 if not services:
                     bot.reply_to(message, "❌ No services! Add a service first.", reply_markup=get_admin_keyboard())
                     return
@@ -345,11 +452,12 @@ def handle_buttons(message):
                     bot.reply_to(message, "❌ No countries! Add a country first.", reply_markup=get_admin_keyboard())
                     return
                 admin_states[user_id] = "rate_select_service"
-                bot.reply_to(message, "💵 **Add Rate — Step 1/3: Select Service**", reply_markup=get_service_keyboard(), parse_mode='Markdown')
+                bot.reply_to(message, "💵 **Add Rate — Step 1/3: Select Service**\n\n_/cancel to abort._", reply_markup=get_service_keyboard(), parse_mode='Markdown')
                 return
 
             # VIEW RATES
             if text == "📋 View Rates":
+                admin_states.pop(user_id, None)
                 if not otp_rates:
                     bot.reply_to(message, "❌ No rates set yet!", reply_markup=get_admin_keyboard())
                     return
@@ -364,6 +472,7 @@ def handle_buttons(message):
 
             # DELETE RATE
             if text == "🗑️ Delete Rate":
+                admin_states.pop(user_id, None)
                 if not otp_rates:
                     bot.reply_to(message, "❌ No rates to delete!", reply_markup=get_admin_keyboard())
                     return
@@ -374,60 +483,68 @@ def handle_buttons(message):
                     service, country = key.split("_", 1) if "_" in key else (key, "?")
                     lines.append(f"{idx}. {service} | {country} → {rate}")
                     idx += 1
-                lines.append("\nType the number (e.g. 1) to delete.")
+                lines.append("\nType the number (e.g. 1) to delete. _/cancel to abort._")
                 bot.reply_to(message, "\n".join(lines), reply_markup=get_admin_keyboard())
                 return
 
             # DELETE SERVICE
             if text == "🗑️ Delete Service":
+                admin_states.pop(user_id, None)
                 if not services:
                     bot.reply_to(message, "❌ No services to delete!", reply_markup=get_admin_keyboard())
                     return
                 admin_states[user_id] = "delete_service"
                 service_list = "\n".join([f"{i+1}. {s}" for i, s in enumerate(services)])
-                bot.reply_to(message, f"🗑️ **Select service to delete:**\n\n{service_list}\n\nType the number or the service name.", reply_markup=get_admin_keyboard())
+                bot.reply_to(message, f"🗑️ **Select service to delete:**\n\n{service_list}\n\nType number or name. _/cancel to abort._", reply_markup=get_admin_keyboard())
                 return
 
             # DELETE COUNTRY
             if text == "🗑️ Delete Country":
+                admin_states.pop(user_id, None)
                 if not countries:
                     bot.reply_to(message, "❌ No countries to delete!", reply_markup=get_admin_keyboard())
                     return
                 admin_states[user_id] = "delete_country"
                 country_list = "\n".join([f"{i+1}. {c}" for i, c in enumerate(countries)])
-                bot.reply_to(message, f"🗑️ **Select country to delete:**\n\n{country_list}\n\nType the number or the country name.", reply_markup=get_admin_keyboard())
+                bot.reply_to(message, f"🗑️ **Select country to delete:**\n\n{country_list}\n\nType number or name. _/cancel to abort._", reply_markup=get_admin_keyboard())
                 return
 
             # DELETE NUMBERS
             if text == "🗑️ Delete Numbers":
+                admin_states.pop(user_id, None)
                 admin_states[user_id] = "delete_numbers_confirm"
                 bot.reply_to(message, "⚠️ **Are you sure?**\n\nType **YES** to confirm.", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
                 return
 
             # VIEW IMPORTED
             if text == "📁 View Imported Numbers":
+                admin_states.pop(user_id, None)
                 view_imported_numbers(message)
                 return
 
             # PENDING WITHDRAWALS
             if text == "⏳ Pending Withdrawals":
+                admin_states.pop(user_id, None)
                 handle_pending_withdrawals(message)
                 return
 
             # ADD SERVICE
             if text == "📝 Add Service":
+                admin_states.pop(user_id, None)
                 admin_states[user_id] = "add_service"
-                bot.reply_to(message, "📝 Enter service name:", parse_mode='Markdown')
+                bot.reply_to(message, "📝 Enter service name:\n\n_/cancel to abort._", parse_mode='Markdown')
                 return
 
             # ADD COUNTRY
             if text == "🌍 Add Country":
+                admin_states.pop(user_id, None)
                 admin_states[user_id] = "add_country"
-                bot.reply_to(message, "🌍 Enter country name:", parse_mode='Markdown')
+                bot.reply_to(message, "🌍 Enter country name:\n\n_/cancel to abort._", parse_mode='Markdown')
                 return
 
             # VIEW SERVICES
             if text == "📋 View Services":
+                admin_states.pop(user_id, None)
                 if not services:
                     bot.reply_to(message, "❌ No services!", reply_markup=get_admin_keyboard())
                 else:
@@ -437,6 +554,7 @@ def handle_buttons(message):
 
             # VIEW COUNTRIES
             if text == "🌐 View Countries":
+                admin_states.pop(user_id, None)
                 if not countries:
                     bot.reply_to(message, "❌ No countries!", reply_markup=get_admin_keyboard())
                 else:
@@ -446,6 +564,7 @@ def handle_buttons(message):
 
             # BOT STATS
             if text == "📊 Bot Stats":
+                admin_states.pop(user_id, None)
                 total_users = len(user_data)
                 total_balance = sum(d.get("balance", 0) for d in user_data.values())
                 total_imported = sum(len(nums) for nums in imported_numbers.values())
@@ -458,83 +577,176 @@ def handle_buttons(message):
                     f"📝 Services: {len(services)}\n"
                     f"🌍 Countries: {len(countries)}\n"
                     f"💵 Rates set: {len(otp_rates)}\n"
-                    f"🎯 Owners tracked: {len(number_owners)}\n"
-                    f"⏱️ Active numbers: {len(active_numbers)}",
+                    f"🎯 Owners tracked: {len(number_owners)}",
                     reply_markup=get_admin_keyboard(), parse_mode='Markdown')
                 return
 
             # ADD BALANCE
             if text == "💳 Add Balance":
+                admin_states.pop(user_id, None)
                 admin_states[user_id] = "add_balance"
-                bot.reply_to(message, "Format: user_id amount\n\nExample: 7030761727 100")
+                bot.reply_to(message, "Format: `user_id amount`\n\nExample: `7030761727 100`\n\n_/cancel to abort._", parse_mode='Markdown')
                 return
 
             # BROADCAST
             if text == "📢 Broadcast":
+                admin_states.pop(user_id, None)
                 admin_states[user_id] = "broadcast"
-                bot.reply_to(message, "📢 Enter broadcast message:", parse_mode='Markdown')
+                bot.reply_to(message, "📢 Enter broadcast message:\n\n_/cancel to abort._", parse_mode='Markdown')
+                return
+
+            # BACKUP DATA
+            if text == "📤 Backup Data":
+                admin_states.pop(user_id, None)
+                try:
+                    with data_lock:
+                        backup = {
+                            "backup_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "user_data": {str(k): v for k, v in user_data.items()},
+                            "user_otp_stats": {str(k): v for k, v in user_otp_stats.items()},
+                            "services": services,
+                            "countries": countries,
+                            "imported_numbers": imported_numbers,
+                            "otp_rates": otp_rates,
+                            "pending_withdrawals": pending_withdrawals,
+                            "withdrawal_history": withdrawal_history[-500:],
+                            "number_owners": number_owners,
+                            "number_meta": number_meta,
+                            "used_numbers_permanent": list(used_numbers_permanent),
+                        }
+                    json_bytes = json.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8")
+                    filename = f"bot_data_{time.strftime('%Y-%m-%d_%H-%M-%S')}.json"
+                    file_obj = io.BytesIO(json_bytes)
+                    file_obj.name = filename
+                    bot.send_document(
+                        message.chat.id, file_obj,
+                        caption=(
+                            f"📤 **Backup Data**\n\n"
+                            f"🕒 {backup['backup_time']}\n"
+                            f"👥 Users: {len(user_data)}\n"
+                            f"📱 Numbers: {sum(len(v) for v in imported_numbers.values())}\n"
+                            f"📝 Services: {len(services)}\n"
+                            f"🌍 Countries: {len(countries)}\n"
+                            f"💵 Rates: {len(otp_rates)}\n"
+                            f"⏳ Pending: {len(pending_withdrawals)}"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    bot.reply_to(message, f"❌ Backup failed: {e}", reply_markup=get_admin_keyboard())
+                return
+
+            # IMPORT BACKUP
+            if text == "📥 Import Backup":
+                admin_states.pop(user_id, None)
+                admin_states[user_id] = "waiting_for_backup_file"
+                bot.reply_to(
+                    message,
+                    "📥 **Restore Backup**\n\n"
+                    "Send me the `bot_data_*.json` file you downloaded earlier.\n\n"
+                    "⚠️ **Warning:** This will REPLACE all current data.\n\n"
+                    "Type **CANCEL** to abort.",
+                    parse_mode='Markdown',
+                    reply_markup=get_admin_keyboard()
+                )
                 return
 
             # USER MENU
             if text == "⬅️ User Menu":
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
                 bot.reply_to(message, "✅ Back to user menu", reply_markup=get_main_keyboard(user_id))
                 return
 
-            # ADMIN STATES
+            # ==========================================================
+            # STEP 5: Admin States (state-specific inputs)
+            # ==========================================================
             state = admin_states.get(user_id)
 
-            if state == "import_select_service" and text in services:
-                service = text.strip()
-                admin_states[user_id] = f"import_select_country|||{service}"
-                bot.reply_to(message, f"✅ Selected: {service}\n\n📥 **Step 2/3: Select Country**", reply_markup=get_country_keyboard(), parse_mode='Markdown')
+            # IMPORT: SERVICE
+            if state == "import_select_service":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "✅ Import cancelled!", reply_markup=get_admin_keyboard())
+                    return
+                if text in services:
+                    admin_states[user_id] = f"import_select_country|||{text}"
+                    bot.reply_to(message, f"✅ Selected: {text}\n\n📥 **Step 2/3: Select Country**", reply_markup=get_country_keyboard(), parse_mode='Markdown')
+                else:
+                    bot.reply_to(message, "❌ Invalid service! Please choose from the buttons.", reply_markup=get_service_keyboard())
                 return
 
-            if state and state.startswith("import_select_country|||") and text in countries:
-                country = text.strip()
-                service = state.split("|||", 1)[1]
-                admin_states[user_id] = f"import_file|||{service}|||{country}"
-                bot.reply_to(message, f"✅ {service} | {country}\n\n📥 **Step 3/3: Send .txt file**", parse_mode='Markdown')
+            # IMPORT: COUNTRY
+            if state and state.startswith("import_select_country|||"):
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "✅ Import cancelled!", reply_markup=get_admin_keyboard())
+                    return
+                if text in countries:
+                    service = state.split("|||", 1)[1]
+                    admin_states[user_id] = f"import_file|||{service}|||{text}"
+                    bot.reply_to(message, f"✅ {service} | {text}\n\n📥 **Step 3/3: Send .txt file**", parse_mode='Markdown')
+                else:
+                    bot.reply_to(message, "❌ Invalid country! Please choose from the buttons.", reply_markup=get_country_keyboard())
                 return
 
-            if state and state.startswith("import_file|||") and text == "⬅️ Back":
-                finish_admin_action(user_id)
-                bot.reply_to(message, "✅ Import cancelled!", reply_markup=get_admin_keyboard())
+            # RATE: SERVICE
+            if state == "rate_select_service":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "✅ Rate setup cancelled!", reply_markup=get_admin_keyboard())
+                    return
+                if text in services:
+                    admin_states[user_id] = f"rate_select_country|||{text}"
+                    bot.reply_to(message, f"✅ Service: {text}\n\n💵 **Step 2/3: Select Country**", reply_markup=get_country_keyboard(), parse_mode='Markdown')
+                else:
+                    bot.reply_to(message, "❌ Invalid service! Please choose from the buttons.", reply_markup=get_service_keyboard())
                 return
 
-            if state == "rate_select_service" and text in services:
-                service = text.strip()
-                admin_states[user_id] = f"rate_select_country|||{service}"
-                bot.reply_to(message, f"✅ Service: {service}\n\n💵 **Step 2/3: Select Country**", reply_markup=get_country_keyboard(), parse_mode='Markdown')
+            # RATE: COUNTRY
+            if state and state.startswith("rate_select_country|||"):
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "✅ Rate setup cancelled!", reply_markup=get_admin_keyboard())
+                    return
+                if text in countries:
+                    service = state.split("|||", 1)[1]
+                    admin_states[user_id] = f"rate_input|||{service}|||{text}"
+                    bot.reply_to(message, f"✅ {text}\n\n💵 **Step 3/3: Enter rate (Taka per OTP)**\n\nExample: `0.5` or `1`\n\n_/cancel to abort._", parse_mode='Markdown')
+                else:
+                    bot.reply_to(message, "❌ Invalid country! Please choose from the buttons.", reply_markup=get_country_keyboard())
                 return
 
-            if state and state.startswith("rate_select_country|||") and text in countries:
-                country = text.strip()
-                service = state.split("|||", 1)[1]
-                admin_states[user_id] = f"rate_input|||{service}|||{country}"
-                bot.reply_to(message, f"✅ {service} | {country}\n\n💵 **Step 3/3: Enter rate (Taka per OTP)**\n\nExample: `0.5` or `1` or `2.5`", parse_mode='Markdown')
-                return
-
+            # RATE: INPUT
             if state and state.startswith("rate_input|||"):
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "✅ Rate setup cancelled!", reply_markup=get_admin_keyboard())
+                    return
                 try:
                     rate = float(text.strip())
                     if rate < 0:
                         raise ValueError
                 except:
-                    bot.reply_to(message, "❌ Invalid rate! Enter a number (e.g. 0.5 or 1).")
+                    bot.reply_to(message, "❌ Invalid rate! Enter a number (e.g. 0.5 or 1).\n\n_/cancel to abort._")
                     return
                 parts = state.split("|||")
                 service = parts[1]
                 country = parts[2]
                 key = f"{service}_{country}"
                 otp_rates[key] = rate
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ **Rate Saved!**\n\nService: {service}\nCountry: {country}\n💵 Rate: {rate} Taka per OTP", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
                 return
 
+            # DELETE RATE
             if state == "rate_delete_confirm":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+                    return
                 if not text.isdigit():
-                    bot.reply_to(message, "❌ Enter a number (e.g. 1).")
+                    bot.reply_to(message, "❌ Enter a number (e.g. 1).\n\n_/cancel to abort._")
                     return
                 index = int(text) - 1
                 keys = list(otp_rates.keys())
@@ -543,29 +755,39 @@ def handle_buttons(message):
                     return
                 key = keys[index]
                 removed_rate = otp_rates.pop(key)
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ Rate deleted: {key} → {removed_rate}", reply_markup=get_admin_keyboard())
                 return
 
+            # ADD SERVICE
             if state == "add_service":
                 if text in services:
                     bot.reply_to(message, f"❌ '{text}' already exists!", reply_markup=get_admin_keyboard())
                     return
                 services.append(text)
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ Added: {text}", reply_markup=get_admin_keyboard())
                 return
 
+            # ADD COUNTRY
             if state == "add_country":
                 if text in countries:
                     bot.reply_to(message, f"❌ '{text}' already exists!", reply_markup=get_admin_keyboard())
                     return
                 countries.append(text)
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ Added: {text}", reply_markup=get_admin_keyboard())
                 return
 
+            # DELETE SERVICE
             if state == "delete_service":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+                    return
                 target = text.strip()
                 service_to_delete = None
                 if target.isdigit():
@@ -576,19 +798,25 @@ def handle_buttons(message):
                     if target in services:
                         service_to_delete = target
                 if not service_to_delete:
-                    bot.reply_to(message, "❌ Service not found!", reply_markup=get_admin_keyboard())
+                    bot.reply_to(message, "❌ Service not found!")
                     return
                 has_numbers = any(k.startswith(f"{service_to_delete}_") and imported_numbers[k] for k in imported_numbers)
                 if has_numbers:
                     bot.reply_to(message, f"❌ **'{service_to_delete}' has numbers attached!**", reply_markup=get_admin_keyboard())
-                    finish_admin_action(user_id)
+                    admin_states.pop(user_id, None)
                     return
                 services.remove(service_to_delete)
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ **'{service_to_delete}' deleted!**", reply_markup=get_admin_keyboard())
                 return
 
+            # DELETE COUNTRY
             if state == "delete_country":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+                    return
                 target = text.strip()
                 country_to_delete = None
                 if target.isdigit():
@@ -599,32 +827,40 @@ def handle_buttons(message):
                     if target in countries:
                         country_to_delete = target
                 if not country_to_delete:
-                    bot.reply_to(message, "❌ Country not found!", reply_markup=get_admin_keyboard())
+                    bot.reply_to(message, "❌ Country not found!")
                     return
                 has_numbers = any(k.endswith(f"_{country_to_delete}") and imported_numbers[k] for k in imported_numbers)
                 if has_numbers:
                     bot.reply_to(message, f"❌ **'{country_to_delete}' has numbers attached!**", reply_markup=get_admin_keyboard())
-                    finish_admin_action(user_id)
+                    admin_states.pop(user_id, None)
                     return
                 countries.remove(country_to_delete)
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
+                save_data()
                 bot.reply_to(message, f"✅ **'{country_to_delete}' deleted!**", reply_markup=get_admin_keyboard())
                 return
 
+            # DELETE NUMBERS
             if state == "delete_numbers_confirm":
                 if text.strip().upper() == "YES":
                     imported_numbers.clear()
                     number_owners.clear()
                     number_meta.clear()
                     active_numbers.clear()
-                    finish_admin_action(user_id)
+                    admin_states.pop(user_id, None)
+                    save_data()
                     bot.reply_to(message, "✅ **All numbers deleted!**", reply_markup=get_admin_keyboard())
                 else:
-                    finish_admin_action(user_id)
+                    admin_states.pop(user_id, None)
                     bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
                 return
 
+            # ADD BALANCE
             if state == "add_balance":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+                    return
                 try:
                     parts = text.split()
                     if len(parts) != 2:
@@ -635,27 +871,36 @@ def handle_buttons(message):
                         raise ValueError
                     ensure_user(target_id)
                     user_data[target_id]["balance"] += amount
-                    finish_admin_action(user_id)
+                    admin_states.pop(user_id, None)
+                    save_data()
                     bot.reply_to(message, f"✅ Balance updated!\nUser: {target_id}\nNew: {user_data[target_id]['balance']:.2f} Taka", reply_markup=get_admin_keyboard())
                 except:
-                    bot.reply_to(message, "❌ Invalid format! Use: user_id amount", reply_markup=get_admin_keyboard())
+                    bot.reply_to(message, "❌ Invalid format! Use: `user_id amount`\n\n_/cancel to abort._", parse_mode='Markdown')
                 return
 
+            # BROADCAST
             if state == "broadcast":
+                if text == "⬅️ Back":
+                    admin_states.pop(user_id, None)
+                    bot.reply_to(message, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+                    return
                 sent = 0
-                for target_id in user_data:
+                for target_id in list(user_data.keys()):
                     try:
-                        bot.send_message(target_id, f"📢 Admin:\n\n{text}")
+                        bot.send_message(target_id, text)
                         sent += 1
                         time.sleep(0.05)
                     except:
                         pass
-                finish_admin_action(user_id)
+                admin_states.pop(user_id, None)
                 bot.reply_to(message, f"✅ Sent to {sent} users", reply_markup=get_admin_keyboard())
                 return
 
-        # ===== USER BUTTONS =====
+        # ==========================================================
+        # STEP 6: User Buttons
+        # ==========================================================
         if text == "☎️GET NUMBERS":
+            admin_states.pop(user_id, None)
             if not services or not countries:
                 bot.reply_to(message, "❌ No services available! Contact admin.", reply_markup=get_main_keyboard(user_id))
                 return
@@ -667,10 +912,12 @@ def handle_buttons(message):
             return
 
         elif text == "💰BALANCE":
+            admin_states.pop(user_id, None)
             handle_wallet(message)
             return
 
         elif text == "💸WITHDRAW":
+            admin_states.pop(user_id, None)
             handle_withdraw(message)
             return
 
@@ -745,7 +992,7 @@ def handle_inline_callbacks(call):
             admin_states[user_id] = f"wd_number|||{method}"
             bot.answer_callback_query(call.id, f"✅ {method} selected")
             bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                  text=f"📱 **{method} Withdrawal**\n\nPlease type your **{method} number**:\n\n_Example: 01712345678_",
+                                  text=f"📱 **{method} Withdrawal**\n\nPlease type your **{method} number**:\n\n_Example: 01712345678_\n\n_/cancel to abort_",
                                   reply_markup=None, parse_mode='Markdown')
             return
 
@@ -772,17 +1019,36 @@ def handle_inline_callbacks(call):
                 pass
             return
 
-        # OTP CHANNEL (blue button)
-        if data.startswith("otp_channel|"):
-            bot.answer_callback_query(call.id, "📢 Opening OTP Channel...", show_alert=False)
-            try:
-                bot.send_message(
-                    call.from_user.id,
-                    "📢 **OTP Channel:**\n\n👉 Join here: " + OTP_CHANNEL_URL,
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
+        # DOWNLOAD UNUSED NUMBERS
+        if data.startswith("dl_unused|"):
+            key = data.split("|", 1)[1]
+            if key not in imported_numbers:
+                bot.answer_callback_query(call.id, "❌ Not found!", show_alert=True)
+                return
+            all_numbers = imported_numbers[key]
+            unused = [n for n in all_numbers if str(n).strip() not in used_numbers_permanent]
+            if not unused:
+                bot.answer_callback_query(call.id, "✅ No unused numbers!", show_alert=True)
+                return
+            content = "\n".join(str(n) for n in unused)
+            filename = f"unused_{key}_{time.strftime('%Y-%m-%d_%H-%M')}.txt"
+            file_obj = io.BytesIO(content.encode("utf-8"))
+            file_obj.name = filename
+            bot.send_document(
+                call.message.chat.id, file_obj,
+                caption=(
+                    f"📥 **Unused Numbers**\n\n"
+                    f"📊 Total: {len(all_numbers)}\n"
+                    f"🎯 Used: {len(all_numbers) - len(unused)}\n"
+                    f"📥 **Unused: {len(unused)}**"
+                ),
+                parse_mode='Markdown'
+            )
+            bot.answer_callback_query(call.id, f"✅ {len(unused)} unused numbers sent!")
+            return
+
+        if data.startswith("dl_none|"):
+            bot.answer_callback_query(call.id, "✅ All numbers are used!", show_alert=True)
             return
 
         # SERVICE SELECTION
@@ -804,7 +1070,7 @@ def handle_inline_callbacks(call):
                                   reply_markup=markup, parse_mode='Markdown')
             return
 
-        # COUNTRY SELECTION → GENERATE NUMBERS
+        # COUNTRY SELECTION
         if data.startswith("cntry|"):
             parts = data.split("|")
             user_id_from_data = int(parts[1])
@@ -816,19 +1082,15 @@ def handle_inline_callbacks(call):
             user_data[user_id]["country"] = country
             key = f"{service}_{country}"
             available = imported_numbers.get(key, [])
-
             if not available:
                 bot.answer_callback_query(call.id, "❌ No numbers available!", show_alert=True)
                 bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
                                       text=f"❌ **No numbers available!**\n\nService: {service}\nCountry: {country}",
                                       reply_markup=None, parse_mode='Markdown')
                 return
-
             numbers_to_give = []
             for _ in range(min(4, len(available))):
                 numbers_to_give.append(available.pop(0))
-
-            # Save ownership + expiry
             now = time.time()
             with data_lock:
                 for num in numbers_to_give:
@@ -836,12 +1098,10 @@ def handle_inline_callbacks(call):
                     number_owners[key_num] = user_id
                     number_meta[key_num] = {"service": service, "country": country}
                     active_numbers[key_num] = {"expires_at": now + NUMBER_EXPIRY_SECONDS}
-
-            print(f"[OWNER] user {user_id} → {numbers_to_give} ({service}/{country})")
-
+                    used_numbers_permanent.add(key_num)
             user_data[user_id]["numbers"] = numbers_to_give
             user_data[user_id]["number"] = numbers_to_give[0]
-
+            save_data()
             send_number_screen(call, user_id, service, country, numbers_to_give)
             return
 
@@ -868,7 +1128,6 @@ def handle_inline_callbacks(call):
             new_numbers = []
             for _ in range(min(4, len(available))):
                 new_numbers.append(available.pop(0))
-
             now = time.time()
             with data_lock:
                 for num in new_numbers:
@@ -876,13 +1135,20 @@ def handle_inline_callbacks(call):
                     number_owners[key_num] = user_id
                     number_meta[key_num] = {"service": service, "country": country}
                     active_numbers[key_num] = {"expires_at": now + NUMBER_EXPIRY_SECONDS}
-
-            print(f"[OWNER] user {user_id} → {new_numbers} ({service}/{country})")
-
+                    used_numbers_permanent.add(key_num)
             user["numbers"] = new_numbers
             user["number"] = new_numbers[0]
-
+            save_data()
             send_number_screen(call, user_id, service, country, new_numbers)
+            return
+
+        # OTP CHANNEL
+        if data.startswith("otp_channel|"):
+            bot.answer_callback_query(call.id, "📢 Opening OTP Channel...", show_alert=False)
+            try:
+                bot.send_message(call.from_user.id, f"📢 **OTP Channel:**\n\n👉 Join: {OTP_CHANNEL_URL}", parse_mode='Markdown')
+            except:
+                pass
             return
 
         bot.answer_callback_query(call.id, "❌ Invalid request!")
@@ -894,22 +1160,11 @@ def handle_inline_callbacks(call):
         except:
             pass
 
-# ================== NUMBER SCREEN (Screenshot Layout) ==================
+# ================== NUMBER SCREEN ==================
 def send_number_screen(call, user_id, service, country, numbers):
-    """
-    Render the number-screen matching the user's screenshot:
-    - Header line: ✅ [Service] ☎️ - [Country]
-    - Waiting message with 25m expiry
-    - 4 green number buttons
-    - Blue "Change" + Blue "OTP" buttons side by side
-    - Red "Back" button
-    """
     header = f"✅ {service} ☎️ - {country}"
 
-    # Build inline keyboard
     markup = InlineKeyboardMarkup(row_width=1)
-
-    # Green number buttons (each on its own row)
     for num in numbers:
         markup.add(InlineKeyboardButton(
             text=f"📋 {number_with_plus(num)}",
@@ -917,30 +1172,11 @@ def send_number_screen(call, user_id, service, country, numbers):
             style="success"
         ))
 
-    # Row 2: Change (blue) + OTP (blue)
-    # Note: pyTelegramBotAPI doesn't have a native 'primary' style. We'll use
-    # style="primary" which renders blue on supported Telegram clients.
-    change_btn = InlineKeyboardButton(
-        text="🔄 Change",
-        callback_data=f"change|{user_id}",
-        style="primary"
-    )
-    otp_btn = InlineKeyboardButton(
-        text="👀 OTP",
-        url=OTP_CHANNEL_URL
-    )
-    try:
-        otp_btn.style = "primary"
-    except Exception:
-        pass
+    change_btn = InlineKeyboardButton(text="🔄 Change", callback_data=f"change|{user_id}", style="primary")
+    otp_btn = InlineKeyboardButton(text="👀 OTP", callback_data=f"otp_channel|{user_id}", style="primary")
     markup.row(change_btn, otp_btn)
 
-    # Row 3: Back (red) - style="danger" → red on supported clients
-    markup.add(InlineKeyboardButton(
-        text="⬅️ Back",
-        callback_data=f"back|{user_id}",
-        style="danger"
-    ))
+    markup.add(InlineKeyboardButton(text="⬅️ Back", callback_data=f"back|{user_id}", style="danger"))
 
     text = (
         f"{header}\n"
@@ -956,16 +1192,11 @@ def send_number_screen(call, user_id, service, country, numbers):
             reply_markup=markup,
             parse_mode='Markdown'
         )
-    except Exception:
+    except Exception as e:
         try:
-            bot.send_message(
-                chat_id=call.message.chat.id,
-                text=text,
-                reply_markup=markup,
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            print(f"❌ send_number_screen error: {e}")
+            bot.send_message(chat_id=call.message.chat.id, text=text, reply_markup=markup, parse_mode='Markdown')
+        except Exception as e2:
+            print(f"❌ send_number_screen error: {e2}")
 
 # ================== DOCUMENT HANDLER ==================
 @bot.message_handler(content_types=['document'])
@@ -975,7 +1206,56 @@ def handle_document(message):
         if not is_admin(user_id):
             bot.reply_to(message, "❌ Not authorized!")
             return
+
         state = admin_states.get(user_id)
+
+        # RESTORE BACKUP
+        if state == "waiting_for_backup_file":
+            file_info = message.document
+            if not file_info.file_name.lower().endswith('.json'):
+                bot.reply_to(message, "❌ Please send a .json file!", reply_markup=get_admin_keyboard())
+                return
+            try:
+                file_path = bot.get_file(file_info.file_id).file_path
+                raw_bytes = bot.download_file(file_path)
+                data = json.loads(raw_bytes.decode("utf-8"))
+
+                global user_data, user_otp_stats, services, countries, imported_numbers, otp_rates
+                global pending_withdrawals, withdrawal_history, number_owners, number_meta, used_numbers_permanent
+
+                with data_lock:
+                    user_data = {int(k): v for k, v in data.get("user_data", {}).items()}
+                    user_otp_stats = {int(k): v for k, v in data.get("user_otp_stats", {}).items()}
+                    services = data.get("services", [])
+                    countries = data.get("countries", [])
+                    imported_numbers = data.get("imported_numbers", {})
+                    otp_rates = data.get("otp_rates", {})
+                    pending_withdrawals = data.get("pending_withdrawals", [])
+                    withdrawal_history = data.get("withdrawal_history", [])
+                    number_owners = data.get("number_owners", {})
+                    number_meta = data.get("number_meta", {})
+                    used_numbers_permanent = set(data.get("used_numbers_permanent", []))
+
+                admin_states.pop(user_id, None)
+                save_data()
+                bot.reply_to(
+                    message,
+                    f"✅ **Backup Restored!**\n\n"
+                    f"👥 Users: {len(user_data)}\n"
+                    f"📱 Numbers: {sum(len(v) for v in imported_numbers.values())}\n"
+                    f"📝 Services: {len(services)}\n"
+                    f"🌍 Countries: {len(countries)}\n"
+                    f"💵 Rates: {len(otp_rates)}\n"
+                    f"⏳ Pending: {len(pending_withdrawals)}",
+                    parse_mode='Markdown',
+                    reply_markup=get_admin_keyboard()
+                )
+            except Exception as e:
+                admin_states.pop(user_id, None)
+                bot.reply_to(message, f"❌ Restore failed: {e}", reply_markup=get_admin_keyboard())
+            return
+
+        # IMPORT NUMBERS
         if not state or not state.startswith("import_file|||"):
             bot.reply_to(message, "❌ Use 'Import Numbers' first!")
             return
@@ -986,7 +1266,7 @@ def handle_document(message):
         parts = state.split("|||")
         if len(parts) < 3:
             bot.reply_to(message, "❌ Invalid state. Restart import.", reply_markup=get_admin_keyboard())
-            finish_admin_action(user_id)
+            admin_states.pop(user_id, None)
             return
         service = parts[1]
         country = parts[2]
@@ -999,8 +1279,7 @@ def handle_document(message):
             return
         numbers = parse_numbers_from_bytes(raw_bytes)
         if not numbers:
-            bot.reply_to(message, "❌ **Failed to read the file!**\n\nMake sure it is a valid .txt file.",
-                         reply_markup=get_admin_keyboard(), parse_mode='Markdown')
+            bot.reply_to(message, "❌ **Failed to read the file!**", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
             return
         key = f"{service}_{country}"
         if key not in imported_numbers:
@@ -1008,8 +1287,9 @@ def handle_document(message):
         existing = set(imported_numbers[key])
         new_numbers = [n for n in numbers if n not in existing]
         imported_numbers[key].extend(new_numbers)
-        finish_admin_action(user_id)
-        rate_note = f"\n💵 Rate: {otp_rates[key]} Taka per OTP" if key in otp_rates else "\n⚠️ No rate set. Use 'Add Rate'."
+        admin_states.pop(user_id, None)
+        save_data()
+        rate_note = f"\n💵 Rate: {otp_rates[key]} Taka per OTP" if key in otp_rates else "\n⚠️ No rate set."
         bot.reply_to(message,
                      f"✅ **Imported!**\n\nService: {service}\nCountry: {country}\n✅ New: {len(new_numbers)}\n📊 Total: {len(imported_numbers[key])}{rate_note}",
                      reply_markup=get_admin_keyboard(), parse_mode='Markdown')
@@ -1022,16 +1302,46 @@ def view_imported_numbers(message):
     if not imported_numbers:
         bot.reply_to(message, "❌ No numbers!", reply_markup=get_admin_keyboard())
         return
-    response = "📁 **Imported Numbers**\n━━━━━━━━━━━━━━━━\n\n"
-    total = 0
+    total_all = 0
+    total_unused_all = 0
+    lines = ["📁 **Imported Numbers**\n━━━━━━━━━━━━━━━━\n"]
     for key, numbers in imported_numbers.items():
-        service, country = key.split("_", 1) if "_" in key else (key, "?")
-        count = len(numbers)
-        total += count
+        if "_" in key:
+            service, country = key.split("_", 1)
+        else:
+            service, country = key, "?"
+        total = len(numbers)
+        used = sum(1 for n in numbers if str(n).strip() in used_numbers_permanent)
+        unused = total - used
+        total_all += total
+        total_unused_all += unused
         rate = otp_rates.get(key, "—")
-        response += f"{service} | {country}: {count} (Rate: {rate})\n"
-    response += f"\n━━━━━━━━━━━━━━━━\n📊 Total: {total}\n💵 Rates: {len(otp_rates)}\n🎯 Owners: {len(number_owners)}\n⏱️ Active: {len(active_numbers)}"
-    bot.reply_to(message, response, reply_markup=get_admin_keyboard(), parse_mode='Markdown')
+        lines.append(f"📱 **{service}** | 🌍 **{country}**\n   Total: {total} | Used: {used} | **Unused: {unused}**\n   💵 Rate: {rate}\n")
+    lines.append("━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 **Total:** {total_all} | 🎯 **Used:** {total_all - total_unused_all} | 📥 **Unused:** {total_unused_all}")
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    for key, numbers in imported_numbers.items():
+        if "_" in key:
+            service, country = key.split("_", 1)
+        else:
+            service, country = key, "?"
+        used = sum(1 for n in numbers if str(n).strip() in used_numbers_permanent)
+        unused = len(numbers) - used
+        if unused > 0:
+            markup.add(InlineKeyboardButton(
+                text=f"📥 Download Unused ({unused}) — {service} / {country}",
+                callback_data=f"dl_unused|{key}",
+                style="primary"
+            ))
+        else:
+            markup.add(InlineKeyboardButton(
+                text=f"✅ All Used — {service} / {country}",
+                callback_data=f"dl_none|{key}",
+                style="primary"
+            ))
+
+    bot.reply_to(message, "\n".join(lines), reply_markup=markup, parse_mode='Markdown')
 
 # ================== PENDING WITHDRAWALS ==================
 def handle_pending_withdrawals(message):
@@ -1048,6 +1358,7 @@ def handle_pending_withdrawals(message):
             message.chat.id,
             f"⏳ **Withdrawal #{i+1}**\n\n👤 User: `{withdrawal['user_id']}`\n💰 Amount: {withdrawal['amount']:.2f} Taka\nMethod: {withdrawal.get('method', 'N/A')}\n📞 Number: `{withdrawal.get('number', 'N/A')}`\nService: {withdrawal.get('service', 'N/A')} | {withdrawal.get('country', 'N/A')}",
             reply_markup=markup, parse_mode='Markdown')
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('approve_') or call.data.startswith('reject_'))
 def handle_withdrawal_action(call):
@@ -1067,6 +1378,8 @@ def handle_withdrawal_action(call):
         number = withdrawal.get('number', 'N/A')
         if action == 'approve':
             pending_withdrawals.pop(index)
+            withdrawal_history.append({**withdrawal, "status": "approved", "action_time": time.strftime("%Y-%m-%d %H:%M:%S")})
+            save_data()
             bot.send_message(target_user, f"✅ **Withdrawal Approved!**\n\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n📞 Number: `{number}`\n\nYour payment has been sent!", parse_mode='Markdown')
             bot.answer_callback_query(call.id, "✅ Approved!")
             bot.edit_message_text(f"✅ **Approved!**\nUser: `{target_user}`\nAmount: {amount:.2f} Taka\nMethod: {method}\nNumber: `{number}`",
@@ -1075,6 +1388,8 @@ def handle_withdrawal_action(call):
             pending_withdrawals.pop(index)
             ensure_user(target_user)
             user_data[target_user]["balance"] += amount
+            withdrawal_history.append({**withdrawal, "status": "rejected", "action_time": time.strftime("%Y-%m-%d %H:%M:%S")})
+            save_data()
             bot.send_message(target_user, f"❌ **Withdrawal Rejected!**\n\n💰 Amount: {amount:.2f} BDT\nMethod: {method}\n\nYour balance has been refunded.", parse_mode='Markdown')
             bot.answer_callback_query(call.id, "❌ Rejected!")
             bot.edit_message_text(f"❌ **Rejected!**\nUser: `{target_user}`\nAmount: {amount:.2f} Taka\nMethod: {method}\nNumber: `{number}`",
@@ -1112,6 +1427,7 @@ def handle_wallet(message):
     markup.add(InlineKeyboardButton("❌ Close", callback_data=f"wallet_close|{user_id}", style="success"))
     bot.reply_to(message, text, reply_markup=markup)
 
+
 def handle_withdraw(message):
     user_id = message.from_user.id
     ensure_user(user_id)
@@ -1138,11 +1454,13 @@ def get_country_info(phone_number):
     except Exception:
         return "Unknown"
 
+
 def extract_otp(message_text):
     if not message_text:
         return "N/A"
     match = re.search(r'\b\d{4,8}\b', str(message_text))
     return match.group(0) if match else "N/A"
+
 
 def find_owner_by_last4(phone_number, owners_dict):
     if not phone_number:
@@ -1157,47 +1475,36 @@ def find_owner_by_last4(phone_number, owners_dict):
             return stored_num, uid
     return None, None
 
+
 def send_to_otp_group(num, cli, message_content, dt=""):
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     country = get_country_info(num)
     service = cli if cli else "Unknown"
     otp_code = extract_otp(message_content)
     masked_num = mask_number(num)
-
     formatted_text = (
-        "🔑 *OTP RECEIVED!*\n"
-        "\n"
-        f"🔢 *Number:* `{masked_num}`\n"
-        "\n"
-        f"🌍 *Country:* {country}\n"
-        "\n"
-        f"👤 *Service:* {service}\n"
-        "\n"
+        "🔑 *OTP RECEIVED!*\n\n"
+        f"🔢 *Number:* `{masked_num}`\n\n"
+        f"🌍 *Country:* {country}\n\n"
+        f"👤 *Service:* {service}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━"
     )
-
     inline_keyboard = {
         "inline_keyboard": [[
             {"text": f"🔑 {otp_code}", "copy_text": {"text": otp_code}, "style": "success"},
             {"text": "📋 FULL SMS", "copy_text": {"text": message_content}, "style": "success"}
         ]]
     }
-
-    payload = {
-        "chat_id": TELEGRAM_OTP_CHAT_ID,
-        "text": formatted_text,
-        "parse_mode": "Markdown",
-        "reply_markup": inline_keyboard
-    }
-
+    payload = {"chat_id": TELEGRAM_OTP_CHAT_ID, "text": formatted_text, "parse_mode": "Markdown", "reply_markup": inline_keyboard}
     try:
         r = requests.post(telegram_url, json=payload, timeout=10)
         if r.status_code == 200:
-            print(f"[{num}] ✅ Sent to OTP group (masked: {masked_num}).")
+            print(f"[{num}] ✅ Sent to OTP group.")
         else:
-            print(f"[{num}] Group send failed: {r.status_code} - {r.text[:200]}")
+            print(f"[{num}] Group failed: {r.status_code}")
     except Exception as e:
         print(f"[{num}] Group error: {e}")
+
 
 def send_to_owner(owner_id, num, cli, message_content, dt="", rate=None):
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -1205,47 +1512,34 @@ def send_to_owner(owner_id, num, cli, message_content, dt="", rate=None):
     service_name = cli if cli else "Unknown"
     otp_code = extract_otp(message_content)
     rate_line = f"💵 *Earned:* +{rate} Taka\n" if rate is not None else ""
-
     formatted_text = (
-        "🎯 *YOUR OTP ARRIVED!*\n"
-        "\n"
-        f"🔢 *Number:* `{num}`\n"
-        "\n"
-        f"🌍 *Country:* {country_name}\n"
-        "\n"
-        f"👤 *Service:* {service_name}\n"
-        "\n"
-        f"🔑 *OTP:* `{otp_code}`\n"
-        "\n"
+        "🎯 *YOUR OTP ARRIVED!*\n\n"
+        f"🔢 *Number:* `{num}`\n\n"
+        f"🌍 *Country:* {country_name}\n\n"
+        f"👤 *Service:* {service_name}\n\n"
+        f"🔑 *OTP:* `{otp_code}`\n\n"
         f"{rate_line}"
         "━━━━━━━━━━━━━━━━━━━━━"
     )
-
     inline_keyboard = {
         "inline_keyboard": [[
             {"text": f"🔑 {otp_code}", "copy_text": {"text": otp_code}, "style": "success"},
             {"text": "📋 FULL SMS", "copy_text": {"text": message_content}, "style": "success"}
         ]]
     }
-
-    payload = {
-        "chat_id": owner_id,
-        "text": formatted_text,
-        "parse_mode": "Markdown",
-        "reply_markup": inline_keyboard
-    }
-
+    payload = {"chat_id": owner_id, "text": formatted_text, "parse_mode": "Markdown", "reply_markup": inline_keyboard}
     try:
         r = requests.post(telegram_url, json=payload, timeout=10)
         if r.status_code == 200:
             print(f"[{num}] 🎯 Forwarded to owner {owner_id}")
             return True
         else:
-            print(f"[{num}] Owner failed: {r.status_code} - {r.text[:200]}")
+            print(f"[{num}] Owner failed: {r.status_code}")
             return False
     except Exception as e:
         print(f"[{num}] Owner error: {e}")
         return False
+
 
 def otp_polling_loop():
     global first_sync_done
@@ -1254,19 +1548,16 @@ def otp_polling_loop():
         try:
             params = {"token": API_TOKEN, "records": RECORDS_TO_FETCH}
             response = requests.get(API_BASE_URL, params=params, timeout=15)
-
             if response.status_code != 200:
                 print(f"API ERROR: {response.status_code}")
                 time.sleep(POLL_INTERVAL)
                 continue
-
             try:
                 res_data = response.json()
             except Exception:
                 print("JSON PARSE ERROR:", response.text[:200])
                 time.sleep(POLL_INTERVAL)
                 continue
-
             messages = []
             if isinstance(res_data, dict):
                 if res_data.get("status") == "success":
@@ -1298,7 +1589,7 @@ def otp_polling_loop():
                     processed_messages.add(unique_id)
                     count += 1
                 first_sync_done = True
-                print(f"🔄 First sync done. Skipped {count} old messages. Now watching for NEW OTPs...")
+                print(f"🔄 First sync done. Skipped {count} old messages.")
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -1315,19 +1606,15 @@ def otp_polling_loop():
                     unique_id = f"{dt}_{num}_{cli}_{message_content}"
                     if unique_id in processed_messages:
                         continue
-
-                    print(f"🆕 NEW OTP FOUND: {num}")
+                    print(f"🆕 NEW OTP: {num}")
                     send_to_otp_group(num, cli, message_content, dt)
-
                     with data_lock:
                         stored_num, owner_id = find_owner_by_last4(num, number_owners)
                         meta = number_meta.get(stored_num, {}) if stored_num else {}
-
                     if owner_id:
                         svc = meta.get("service")
                         ctry = meta.get("country")
                         rate = otp_rates.get(f"{svc}_{ctry}") if svc and ctry else None
-
                         with data_lock:
                             ensure_user(owner_id)
                             if rate is not None:
@@ -1341,29 +1628,20 @@ def otp_polling_loop():
                                 stats["last_date"] = today
                             stats["total"] += 1
                             stats["today"] += 1
-
-                            # mark number as used (remove from active)
                             if stored_num:
                                 active_numbers.pop(stored_num, None)
-
+                        save_data()
                         if rate is not None:
-                            print(f"[{num}] 💰 +{rate} Taka → user {owner_id} (OTP #{stats['total']})")
-                        else:
-                            print(f"[{num}] ⚠️ No rate set for {svc}/{ctry} — OTP counted, no balance added")
-
+                            print(f"[{num}] 💰 +{rate} Taka → user {owner_id}")
                         send_to_owner(owner_id, num, cli, message_content, dt, rate=rate)
                     else:
-                        print(f"[{num}] No owner (last 4 digits didn't match).")
-
+                        print(f"[{num}] No owner matched.")
                     processed_messages.add(unique_id)
                     if len(processed_messages) > 2000:
                         processed_messages.pop()
-
                     time.sleep(1)
-
         except Exception as e:
             print(f"OTP LOOP ERROR: {e}")
-
         time.sleep(POLL_INTERVAL)
 
 # ================== RUN ==================
@@ -1371,6 +1649,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🤖 BOT + OTP FORWARDER + RATE + WITHDRAW + SUPPORT")
     print("=" * 60)
+    load_data()
     print(f"✅ Services: {len(services)}")
     print(f"✅ Countries: {len(countries)}")
     print(f"💵 Rates set: {len(otp_rates)}")
@@ -1379,13 +1658,14 @@ if __name__ == "__main__":
     print("🚀 Bot starting...")
     print("=" * 60)
 
-    # Start OTP polling thread
     otp_thread = threading.Thread(target=otp_polling_loop, daemon=True)
     otp_thread.start()
 
-    # Start expiry thread (25-min auto-expire)
     expiry_thread = threading.Thread(target=expire_loop, daemon=True)
     expiry_thread.start()
+
+    save_thread = threading.Thread(target=auto_save_loop, daemon=True)
+    save_thread.start()
 
     while True:
         try:
